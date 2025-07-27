@@ -1,0 +1,65 @@
+import torch
+import torch.nn.functional as F
+
+
+@torch.no_grad()
+def error_computing(quantized_matrix, origin_matrix):
+    mse = torch.mean((origin_matrix - quantized_matrix) ** 2)
+    print(origin_matrix.shape, quantized_matrix.shape, mse)
+    return mse
+
+@torch.no_grad()
+def kl_div(quantized_matrix, origin_matrix):
+    tensor1 = F.softmax(quantized_matrix, dim=-1)
+    tensor2 = F.softmax(origin_matrix, dim=-1)
+    
+    tensor1 = tensor1.clamp(min=1e-6)
+    tensor2 = tensor2.clamp(min=1e-6)
+    kl_div = F.kl_div(torch.log(tensor2), tensor1, reduction='batchmean')
+    return kl_div
+@torch.no_grad()
+def channel_wise_distribution_loss(quantized_matrix, origin_matrix, eps=1e-6):
+   
+   
+    mean_q = quantized_matrix.mean(dim=-1, keepdim=True)  
+    mean_f = origin_matrix.mean(dim=-1, keepdim=True)    
+
+    var_q = quantized_matrix.var(dim=-1, unbiased=False, keepdim=True)  
+    var_f = origin_matrix.var(dim=-1, unbiased=False, keepdim=True)   
+
+
+    var_q = var_q.clamp(min=eps)
+    var_f = var_f.clamp(min=eps)
+
+
+    mean_loss = torch.norm(mean_f - mean_q, p=2)
+
+
+    var_loss = torch.norm(var_f - var_q, p=2)
+
+
+    loss = (mean_loss + var_loss) / mean_q.size(-1)  
+
+    return loss
+
+@torch.no_grad()
+def ssim(x, y, C1=0.01**2, C2=0.03**2):
+    n, m = x.shape
+    
+
+    mu_x = x.mean(dim=1, keepdim=True)
+    mu_y = y.mean(dim=1, keepdim=True)
+    
+
+    sigma_x = x.var(dim=1, unbiased=False, keepdim=True)
+    sigma_y = y.var(dim=1, unbiased=False, keepdim=True)
+    
+
+    sigma_xy = ((x - mu_x) * (y - mu_y)).mean(dim=1, keepdim=True)
+    
+
+    numerator = (2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)
+    denominator = (mu_x.pow(2) + mu_y.pow(2) + C1) * (sigma_x + sigma_y + C2)
+    ssim_vals = numerator / denominator
+  
+    return ssim_vals.mean()
