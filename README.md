@@ -20,6 +20,16 @@ cd mlwq
 pip install --upgrade pip 
 pip install -r requirements.txt
 ```
+
+In our fork, we will not use Conda as the environment and package manager. Instead we will use uv([Install guide](https://docs.astral.sh/uv/getting-started/installation/)). 
+
+```bash
+cd mlwq
+uv venv pythom 3.10
+source .venv/bin/activate
+uv pip install -r requirements
+```
+
 ___
 - **Usage**
 ```bash
