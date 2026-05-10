@@ -29,7 +29,8 @@ cd mlwq/mlwq
 uv venv --python 3.10
 # Or uv venv python 3.10
 source .venv/bin/activate
-uv pip install -r requirements
+uv pip install -r requirements.txt
+# Or uv pip install -r requirements
 ```
 
 ___
