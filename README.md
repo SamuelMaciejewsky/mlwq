@@ -26,7 +26,8 @@ In our fork, we will not use Conda as the environment and package manager. Inste
 ```bash
 git clone https://github.com/SamuelMaciejewsky/mlwq.git
 cd mlwq/mlwq
-uv venv pythom 3.10
+uv venv --python 3.10
+# Or uv venv python 3.10
 source .venv/bin/activate
 uv pip install -r requirements
 ```
