@@ -4,9 +4,9 @@ import torch
 import torch.nn as nn
 import tqdm
 from mlwq.mlwq_gptq import MLWQGPTQ
-from utils.mixed_quantizer import Quantizer
-from modelutils import find_layers
-import itertools
+from mlwq.bpll import compute_bit_assignments
+from mlwq.modelutils import find_layers
+from mlwq.utils.mixed_quantizer import Quantizer
 
 
 def get_model(model):
@@ -39,46 +39,15 @@ def get_model(model):
         model.seqlen=2048
     return model
 
-def find_best_bitwidth_combination(average_errors,gptq, bit_options, num_sublayers, target_total):
-    all_combinations = list(itertools.product(bit_options, repeat=num_sublayers))
- 
-    min_total_error=100000000
-    for comb in all_combinations:
-        count_of_ones = comb.count(1)
-    
-        if sum(comb) == target_total and count_of_ones==0:  
-            total_error = 0.0
-         
-            for i, bit_width in enumerate(comb):
-                total_error += average_errors[i][bit_width - 2]  
-              
-            if total_error < min_total_error:
-                min_total_error = total_error
-                best_combination = comb
-
-
-    return best_combination,min_total_error
-
-  
-
 def compute_bit(gptq):
-    average_errors=[]
-    suma=0
-    sumx=0
-    for name, sublayer in gptq.items():
-    
-        zipped = zip(*sublayer.block_errors)
-        average_error = [np.mean(item) for item in zipped]
-        average_errors.append(average_error)
-       
-    best_combination, min_total_error = find_best_bitwidth_combination(average_errors,gptq, bit_options=[2,3], num_sublayers=7, target_total=20)
-    best_combinations={}
-  
-    for index,(name, sublayer) in enumerate(gptq.items()):
-        
-        best_combinations[name] = best_combination[index]
-        
-    return  best_combinations
+    target_total = 3 * len(gptq) - 1
+    best_combinations, min_total_error = compute_bit_assignments(
+        gptq,
+        bit_options=(2, 3),
+        target_total=target_total,
+    )
+    print("BPLL min total error:", min_total_error)
+    return best_combinations
 
 
 @torch.no_grad()
@@ -267,6 +236,7 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
                 saved_block_precision=saved_block_precision[i][name] if (saved_block_precision is not None) else None,
             )
             mixed_block_precision[i][name] = layer_block_precision
+            quantizers[f"model.layers.{i}.{name}"] = (scales, zeros, g_idx)
 
 
             gptq[name].free()
@@ -286,7 +256,7 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
   
    
     model.config.use_cache = use_cache
-    return quantizers
+    return quantizers, mixed_block_precision
 
 def pack_model(model, save_path, bits, group_size, quantizers, block_bits):
     import sys, os
@@ -318,7 +288,9 @@ def pack_model(model, save_path, bits, group_size, quantizers, block_bits):
 
 if __name__ == "__main__":
     import argparse
-    from datautils import *
+    import os
+
+    from mlwq.datautils import get_loaders
 
     def list_of_ints(arg):
         return list(map(int, arg.split(',')))
@@ -445,6 +417,8 @@ if __name__ == "__main__":
   
     save_title = f"{args.model}_{args.dataset}_{args.low_quant_method}_{groupsize}"
     save_file = "./output/" + save_title.replace("/", "_") + ".pt"
+    quantizers = {}
+    mixed_block_precision = {}
     if args.load_quantized:
         model = get_model(save_file)
         model.eval()
@@ -461,7 +435,7 @@ if __name__ == "__main__":
             seqlen=model.seqlen,
         )
        
-        quantizers = quant_sequential(model, dataloader, device, block_precision)
+        quantizers, mixed_block_precision = quant_sequential(model, dataloader, device, block_precision)
         print("quantization time:", time.time() - tick, "s")
    
     
@@ -471,22 +445,25 @@ if __name__ == "__main__":
         )
         print(dataset)
         if "opt" in args.model:
-            from eval_ppl_utils import opt_eval
+            from mlwq.eval_ppl_utils import opt_eval
 
             opt_eval(model, testloader, device, dataset, args.log_wandb)
         elif "llama" in args.model or "Smo" in args.model:
-            from eval_ppl_utils import llama_eval
+            from mlwq.eval_ppl_utils import llama_eval
 
             llama_eval(model, testloader, device, dataset, args.log_wandb)
     if args.tasks != "":
-        from eval_ppl_utils import zeroshot_evaluate
+        from mlwq.eval_ppl_utils import zeroshot_evaluate
         zeroshot_evaluate(model, args)
 
     if args.save:
       
         if args.pack:
+            if not quantizers:
+                raise RuntimeError("--pack requires quantization metadata from a fresh run")
             bits = int(args.low_quant_method[0])
-            pack_model(model, save_file, bits, groupsize, quantizers, block_precision)
+            block_bits = block_precision if block_precision is not None else mixed_block_precision
+            pack_model(model, save_file, bits, groupsize, quantizers, block_bits)
        
         else:
             save_path = os.path.dirname(save_file)

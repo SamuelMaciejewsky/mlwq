@@ -15,4 +15,6 @@ scipy==1.13.1
 sqlitedict==2.1.0
 torch==2.2.1
 tqdm==4.66.2
-
+transformers==4.41.2
+datasets==2.19.1
+lm-eval==0.4.2

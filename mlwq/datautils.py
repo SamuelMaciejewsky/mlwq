@@ -33,7 +33,7 @@ def get_tokenizer(model):
 def get_wikitext2(nsamples, seed, seqlen, model, tokenizer):
     
     traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-    testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')-raw
+    testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
     
 
     trainenc = tokenizer(" ".join(traindata['text']), return_tensors='pt')
@@ -107,7 +107,8 @@ def get_c4(nsamples, seed, seqlen, model, tokenizer):
 
 def get_loaders(name, nsamples=128, seed=0, seqlen=2048, model=''):
 
-    cache_file=f'cache/{name}_{nsamples}_{seed}_{seqlen}_{model}.pt'
+    safe_model = model.replace('/', '_')
+    cache_file=f'cache/{name}_{nsamples}_{seed}_{seqlen}_{safe_model}.pt'
     try:
         return torch.load(cache_file)
     except:
@@ -117,11 +118,11 @@ def get_loaders(name, nsamples=128, seed=0, seqlen=2048, model=''):
     
     if 'wikitext2' in name:
         loaders= get_wikitext2(nsamples, seed, seqlen, model, tokenizer)
-    if 'ptb' in name:
+    elif 'ptb' in name:
         loaders= get_ptb(nsamples, seed, seqlen, model, tokenizer)
-    if 'c4' in name:
+    elif 'c4' in name:
         loaders= get_c4(nsamples, seed, seqlen, model, tokenizer)
-    if 'mix' in name:
+    elif 'mix' in name:
         wiki_train,wiki_val=get_wikitext2(nsamples//3, seed, seqlen, model, tokenizer)
         ptb_train,ptb_val=get_ptb(nsamples//3, seed, seqlen, model, tokenizer)
         c4_train,c4_val=get_c4(nsamples//3, seed, seqlen, model, tokenizer)
@@ -134,6 +135,8 @@ def get_loaders(name, nsamples=128, seed=0, seqlen=2048, model=''):
         torch.save((mixed_loader, val),cache_file)
 
         return mixed_loader, val
+    else:
+        raise ValueError(f"unknown dataset: {name}")
 
     directory='/'.join(cache_file.split('/')[:-1])
     if not os.path.exists(directory):

@@ -1,8 +1,11 @@
-from lm_eval import evaluator
+try:
+    from lm_eval import evaluator
+except ImportError:
+    evaluator = None
 import torch
 import torch.nn as nn
 from pprint import pprint
-from categories import subcategories, categories
+from mlwq.categories import subcategories, categories
 import numpy as np
 
 
@@ -201,7 +204,9 @@ def zeroshot_evaluate(model, args):
         model.transformer = model.transformer.to(model.device)
 
     if args.tasks != "":
-        from model_utils.LMClass import LMClass
+        if evaluator is None:
+            raise ImportError("lm-eval is required for --tasks")
+        from mlwq.model_utils.LMClass import LMClass
         lm = LMClass(model, args)
 
         t_results = evaluator.simple_evaluate(
