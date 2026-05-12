@@ -1,7 +1,12 @@
 import itertools
 
 
-def find_best_bitwidth_combination(average_errors, bit_options, target_total):
+def find_best_bitwidth_combination(
+    average_errors,
+    bit_options,
+    target_total,
+    layer_sizes=None,
+):
     """Return the minimum-error bit allocation under a total bit budget."""
     if not average_errors:
         return (), 0.0
@@ -9,11 +14,15 @@ def find_best_bitwidth_combination(average_errors, bit_options, target_total):
     bit_options = tuple(sorted(set(int(bit) for bit in bit_options)))
     bit_index = {bit: index for index, bit in enumerate(bit_options)}
     num_sublayers = len(average_errors)
+    layer_sizes = [1] * num_sublayers if layer_sizes is None else list(layer_sizes)
+    if len(layer_sizes) != num_sublayers:
+        raise ValueError("layer_sizes must match average_errors length")
+
     best_combination = None
     min_total_error = float("inf")
 
     for combination in itertools.product(bit_options, repeat=num_sublayers):
-        if sum(combination) != target_total:
+        if sum(bit * size for bit, size in zip(combination, layer_sizes)) != target_total:
             continue
 
         total_error = 0.0
@@ -38,11 +47,17 @@ def find_best_bitwidth_combination(average_errors, bit_options, target_total):
     return best_combination, min_total_error
 
 
-def compute_bit_assignments(gptq, bit_options=(2, 3), target_total=None):
+def compute_bit_assignments(gptq, bit_options=(2, 3), target_total=None, layer_sizes=None):
     """Compute BPLL bit assignments from each sublayer's block_errors."""
     names = list(gptq)
     if target_total is None:
         target_total = 3 * len(names) - 1
+    if layer_sizes is None:
+        layer_sizes = [1] * len(names)
+    elif isinstance(layer_sizes, dict):
+        layer_sizes = [layer_sizes[name] for name in names]
+    else:
+        layer_sizes = list(layer_sizes)
 
     average_errors = []
     for name in names:
@@ -57,5 +72,6 @@ def compute_bit_assignments(gptq, bit_options=(2, 3), target_total=None):
         average_errors,
         bit_options=bit_options,
         target_total=target_total,
+        layer_sizes=layer_sizes,
     )
     return dict(zip(names, best_combination)), min_total_error

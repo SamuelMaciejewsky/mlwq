@@ -1,4 +1,7 @@
 import time
+import json
+import platform
+import subprocess
 
 import torch
 import torch.nn as nn
@@ -39,12 +42,65 @@ def get_model(model):
         model.seqlen=2048
     return model
 
+def bit_options_for_target(target_bits):
+    target_bits = int(target_bits)
+    if target_bits <= 2:
+        return (2, 3), 2
+    if target_bits == 3:
+        return (2, 3), 3
+    return (target_bits - 1, target_bits), target_bits
+
+
+def salience_ratios_for_bits(bits):
+    if int(bits) <= 2:
+        return 0.02, 0.10
+    if int(bits) == 3:
+        return 0.05, 0.05
+    return 0.10, 0.02
+
+
+def current_git_commit():
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return ""
+
+
+def cuda_metrics_for_device(device):
+    metric_device = torch.device(device)
+    if not (torch.cuda.is_available() and metric_device.type == "cuda"):
+        return {}
+
+    device_index = metric_device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    properties = torch.cuda.get_device_properties(device_index)
+    return {
+        "cuda_available": True,
+        "gpu": torch.cuda.get_device_name(device_index),
+        "gpu_memory_total_gb": round(properties.total_memory / (1024 ** 3), 2),
+    }
+
+
 def compute_bit(gptq):
-    target_total = 3 * len(gptq) - 1
+    requested_bits = int(args.low_quant_method[0])
+    bit_options, target_average = bit_options_for_target(requested_bits)
+    layer_sizes = {
+        name: int(sublayer.layer.weight.data.numel())
+        for name, sublayer in gptq.items()
+    }
+    target_total = target_average * sum(layer_sizes.values())
+    if len(gptq) > 1 and target_average > min(bit_options):
+        target_total -= min(layer_sizes.values())
     best_combinations, min_total_error = compute_bit_assignments(
         gptq,
-        bit_options=(2, 3),
+        bit_options=bit_options,
         target_total=target_total,
+        layer_sizes=layer_sizes,
     )
     print("BPLL min total error:", min_total_error)
     return best_combinations
@@ -140,6 +196,7 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
         position_ids = cache["position_ids"]
 
     print("Ready.")
+    bpll_bit_options, _ = bit_options_for_target(int(args.low_quant_method[0]))
     index = 0
     mixed_block_precision = {}
     quantizers = {}
@@ -170,7 +227,29 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
             gptq[name] = MLWQGPTQ(
                 subset[name],
                 quantizer,
-                bit_width = int(args.low_quant_method[0])
+                bit_width = int(args.low_quant_method[0]),
+                bpll_loss=args.bpll_loss,
+                tqp_grid=args.tqp_grid,
+                hessian_mode=args.hessian_mode,
+                hessian_full_threshold=args.hessian_full_threshold,
+                bit_options=bpll_bit_options,
+            )
+
+        if not gptq:
+            if not (args.minlayer <= i < args.maxlayer) and not args.invert:
+                for j in range(args.nsamples):
+                    if "opt" in args.model:
+                        outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                    else:
+                        outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                layers[i] = layer.cpu()
+                del layer
+                torch.cuda.empty_cache()
+                inps, outs = outs, inps
+                continue
+            raise ValueError(
+                f"no quantizable sublayers selected in layer {i}; "
+                "check --quant_only/--minlayer/--maxlayer/--invert"
             )
 
         def add_batch(name):
@@ -201,21 +280,9 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
         
 
         for name in gptq:
-            
-            if best_combinations[name]==2:
-               
-                if subset[name].weight.data.shape[1]==8192:
-                    gptq[name].get_salience1(name,i,6,1364,blocksize=args.groupsize)
-                    
-                else:
-                    gptq[name].get_salience1(name,i,6,511,blocksize=args.groupsize)
-              
-                sv+=best_combinations[name]*subset[name].weight.data.shape[0]*(subset[name].weight.data.shape[1]-100)+3*subset[name].weight.data.shape[0]*50+4*subset[name].weight.data.shape[0]*50  
-            else:
-                gptq[name].get_salience(name,i,1,blocksize=args.groupsize)
-                sv+=best_combinations[name]*subset[name].weight.data.shape[0]*(subset[name].weight.data.shape[1]-100)+2*subset[name].weight.data.shape[0]*50+4*subset[name].weight.data.shape[0]*50          
-                 
-           
+            high_ratio, low_ratio = salience_ratios_for_bits(best_combinations[name])
+            gptq[name].get_salience1(name, i, high_ratio, low_ratio, blocksize=args.groupsize)
+            sv+=best_combinations[name]*subset[name].weight.data.shape[0]*subset[name].weight.data.shape[1]
             sumc+=subset[name].weight.data.shape[0]*subset[name].weight.data.shape[1]
         sv=sv/sumc 
         
@@ -398,6 +465,37 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pack", action="store_true", help="Whether to save the packed model."
     )
+    parser.add_argument(
+        "--eval_fp16_only", action="store_true", help="Skip quantization and only evaluate FP16 PPL."
+    )
+    parser.add_argument(
+        "--bpll_loss",
+        type=str,
+        default="activation_dist",
+        choices=["activation_dist", "weight_mse"],
+        help="Loss used by BPLL when ranking bit-width choices.",
+    )
+    parser.add_argument(
+        "--tqp_grid",
+        type=list_of_floats,
+        default=[1.0, 0.95, 0.9, 0.85],
+        help="Comma-separated clipping ratios for TQP grid search.",
+    )
+    parser.add_argument(
+        "--hessian_mode",
+        type=str,
+        default="diag",
+        choices=["diag", "full"],
+        help="Use diagonal Hessian approximation or full inverse-Hessian diagonal when small enough.",
+    )
+    parser.add_argument(
+        "--hessian_full_threshold",
+        type=int,
+        default=1024,
+        help="Maximum input dimension for full Hessian inverse in salience.",
+    )
+    parser.add_argument("--run_name", type=str, default="", help="Name used in metrics output.")
+    parser.add_argument("--save_metrics", type=str, default="", help="Path to a JSON metrics file.")
 
     args = parser.parse_args()
    
@@ -406,7 +504,9 @@ if __name__ == "__main__":
     groupsize = args.groupsize
     net = args.model.split("/")[-1]
     block_configurations = f'../block_precision_{args.groupsize}_{args.low_quant_method}/{net}.pt'
-    if os.path.exists(block_configurations):
+    if args.eval_fp16_only:
+        block_precision = None
+    elif os.path.exists(block_configurations):
         block_precision = torch.load(block_configurations)
     else:
         print(f'Block precisions of {net} does not exist. Start aware!')
@@ -419,24 +519,48 @@ if __name__ == "__main__":
     save_file = "./output/" + save_title.replace("/", "_") + ".pt"
     quantizers = {}
     mixed_block_precision = {}
+    metrics = {
+        "run_name": args.run_name,
+        "model": args.model,
+        "dataset": args.dataset,
+        "low_quant_method": args.low_quant_method,
+        "seed": args.seed,
+        "nsamples": args.nsamples,
+        "groupsize": args.groupsize,
+        "device": args.device,
+        "bpll_loss": args.bpll_loss,
+        "tqp_grid": args.tqp_grid,
+        "hessian_mode": args.hessian_mode,
+        "hessian_full_threshold": args.hessian_full_threshold,
+        "eval_fp16_only": args.eval_fp16_only,
+        "quantized": False,
+        "git_commit": current_git_commit(),
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+    }
+    metrics.update(cuda_metrics_for_device(device))
+
     if args.load_quantized:
         model = get_model(save_file)
         model.eval()
     else:
         model = get_model(args.model)
         model.eval()
-        tick = time.time()
-     
-        dataloader, testloader = get_loaders(
-            args.dataset,
-            nsamples=args.nsamples,
-            seed=args.seed,
-            model=args.model,
-            seqlen=model.seqlen,
-        )
-       
-        quantizers, mixed_block_precision = quant_sequential(model, dataloader, device, block_precision)
-        print("quantization time:", time.time() - tick, "s")
+        if not args.eval_fp16_only:
+            tick = time.time()
+            dataloader, testloader = get_loaders(
+                args.dataset,
+                nsamples=args.nsamples,
+                seed=args.seed,
+                model=args.model,
+                seqlen=model.seqlen,
+            )
+            quantizers, mixed_block_precision = quant_sequential(model, dataloader, device, block_precision)
+            metrics["quantization_time_s"] = time.time() - tick
+            metrics["quantized"] = True
+            print("quantization time:", metrics["quantization_time_s"], "s")
+    metrics["model_seqlen"] = getattr(model, "seqlen", None)
    
     
     for dataset in ["wikitext2"]:
@@ -447,11 +571,11 @@ if __name__ == "__main__":
         if "opt" in args.model:
             from mlwq.eval_ppl_utils import opt_eval
 
-            opt_eval(model, testloader, device, dataset, args.log_wandb)
+            metrics[f"{dataset}_ppl"] = opt_eval(model, testloader, device, dataset, args.log_wandb)
         elif "llama" in args.model or "Smo" in args.model:
             from mlwq.eval_ppl_utils import llama_eval
 
-            llama_eval(model, testloader, device, dataset, args.log_wandb)
+            metrics[f"{dataset}_ppl"] = llama_eval(model, testloader, device, dataset, args.log_wandb)
     if args.tasks != "":
         from mlwq.eval_ppl_utils import zeroshot_evaluate
         zeroshot_evaluate(model, args)
@@ -470,3 +594,11 @@ if __name__ == "__main__":
             if not os.path.exists(save_path):
                 os.makedirs(save_path)
             model.save_pretrained(save_file)
+
+    if args.save_metrics:
+        metrics_path = args.save_metrics
+        metrics_dir = os.path.dirname(metrics_path)
+        if metrics_dir and not os.path.exists(metrics_dir):
+            os.makedirs(metrics_dir)
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2, sort_keys=True)

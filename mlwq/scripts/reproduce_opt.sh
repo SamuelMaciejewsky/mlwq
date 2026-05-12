@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODEL="${MODEL:-facebook/opt-125m}"
+DEVICE="${DEVICE:-cuda:0}"
+GROUPSIZE="${GROUPSIZE:-128}"
+SEED="${SEED:-0}"
+NSAMPLES="${NSAMPLES:-128}"
+SMOKE_NSAMPLES="${SMOKE_NSAMPLES:-1}"
+BPLL_LOSS="${BPLL_LOSS:-activation_dist}"
+TQP_GRID="${TQP_GRID:-1.0,0.95,0.9,0.85}"
+MODEL_SLUG="${MODEL//\//_}"
+
+mkdir -p logs metrics
+
+python -V | tee logs/env.txt
+python -m pip freeze | tee -a logs/env.txt
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi | tee logs/nvidia-smi.txt
+else
+  echo "nvidia-smi not found" | tee logs/nvidia-smi.txt
+fi
+
+python -m py_compile mlwq/*.py mlwq/utils/*.py mlwq/model_utils/*.py
+python -m pytest tests
+
+python -m mlwq.run "$MODEL" wikitext2 3bit \
+  --device "$DEVICE" \
+  --seed "$SEED" \
+  --nsamples "$NSAMPLES" \
+  --groupsize "$GROUPSIZE" \
+  --eval_fp16_only \
+  --run_name "${MODEL_SLUG}_fp16_wikitext2" \
+  --save_metrics "metrics/${MODEL_SLUG}_fp16_wikitext2.json" \
+  2>&1 | tee "logs/${MODEL_SLUG}_fp16_wikitext2.log"
+
+python -m mlwq.run "$MODEL" wikitext2 3bit \
+  --device "$DEVICE" \
+  --seed "$SEED" \
+  --nsamples "$SMOKE_NSAMPLES" \
+  --groupsize "$GROUPSIZE" \
+  --run_name "${MODEL_SLUG}_smoke_ns${SMOKE_NSAMPLES}" \
+  --save_metrics "metrics/${MODEL_SLUG}_smoke_ns${SMOKE_NSAMPLES}.json" \
+  2>&1 | tee "logs/${MODEL_SLUG}_smoke_ns${SMOKE_NSAMPLES}.log"
+
+python -m mlwq.run "$MODEL" wikitext2 3bit \
+  --device "$DEVICE" \
+  --seed "$SEED" \
+  --nsamples "$NSAMPLES" \
+  --groupsize "$GROUPSIZE" \
+  --bpll_loss "$BPLL_LOSS" \
+  --tqp_grid "$TQP_GRID" \
+  --run_name "${MODEL_SLUG}_mlwq_3bit_ns${NSAMPLES}" \
+  --save_metrics "metrics/${MODEL_SLUG}_mlwq_3bit_ns${NSAMPLES}.json" \
+  2>&1 | tee "logs/${MODEL_SLUG}_mlwq_3bit_ns${NSAMPLES}.log"

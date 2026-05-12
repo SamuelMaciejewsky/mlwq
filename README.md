@@ -45,6 +45,24 @@ Zero-shot evaluation requires a compatible `lm-eval` installation:
 python -m mlwq.run facebook/opt-125m wikitext2 3bit --device cuda:0 --tasks piqa
 ```
 
+## Paper-Like OPT Reproduction
+
+On a CUDA machine, run the staged OPT reproduction script:
+
+```bash
+bash mlwq/scripts/reproduce_opt.sh
+```
+
+Use a larger OPT model only after `facebook/opt-125m` completes:
+
+```bash
+MODEL=facebook/opt-350m bash mlwq/scripts/reproduce_opt.sh
+```
+
+The script writes raw logs to `logs/` and structured metrics to `metrics/`.
+
+For the 16 GB VRAM target, treat `facebook/opt-125m` as the acceptance run. Move to `facebook/opt-350m` only after the FP16 baseline, smoke run, and full `nsamples=128` MLWQ run complete.
+
 ## Paper
 
 The project paper is in `docs/` as both PDF and extracted Markdown. See `docs/reproducibility.md` for the implementation mapping and current reproducibility boundary.

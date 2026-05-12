@@ -77,6 +77,7 @@ def llama_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
 
     testenc = testenc.to(dev)
     nlls = []
+    total_tokens = 0
     for i in range(nsamples):
         hidden_states = inps[i].unsqueeze(0)
         if model.model.norm is not None:
@@ -88,12 +89,15 @@ def llama_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
         loss = loss_fct(
             shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
         )
-        neg_log_likelihood = loss.float() * model.seqlen
+        valid_tokens = shift_labels.numel()
+        neg_log_likelihood = loss.float() * valid_tokens
         nlls.append(neg_log_likelihood)
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
+        total_tokens += valid_tokens
+    ppl = torch.exp(torch.stack(nlls).sum() / total_tokens)
     print(f"Perplexity: {ppl.item():3f}")
 
     model.config.use_cache = use_cache
+    return ppl.item()
 
 @torch.no_grad()
 def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
@@ -169,6 +173,7 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
 
     testenc = testenc.to(dev)
     nlls = []
+    total_tokens = 0
     for i in range(nsamples):
         hidden_states = inps[i].unsqueeze(0)
         if model.model.decoder.final_layer_norm is not None:
@@ -182,13 +187,16 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
         ][:, 1:]
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        neg_log_likelihood = loss.float() * model.seqlen
+        valid_tokens = shift_labels.numel()
+        neg_log_likelihood = loss.float() * valid_tokens
         nlls.append(neg_log_likelihood)
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
+        total_tokens += valid_tokens
+    ppl = torch.exp(torch.stack(nlls).sum() / total_tokens)
     print(f"Perplexity: {ppl.item():3f}")
     print({f'{dataset}/perplexity': ppl.item()})
 
     model.config.use_cache = use_cache
+    return ppl.item()
 
 @torch.no_grad()
 def zeroshot_evaluate(model, args):

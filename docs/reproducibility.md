@@ -12,7 +12,7 @@ This repository includes the MLWQ paper in `docs/` as PDF and Markdown. The PDF 
 
 ## Code Mapping
 
-- BPLL allocation lives in `mlwq/bpll.py` and is used by `mlwq/run.py`.
+- BPLL allocation lives in `mlwq/bpll.py` and is used by `mlwq/run.py`; the bit budget is weighted by each sublayer's parameter count.
 - Channel-wise distribution helpers live in `mlwq/utils/reconstruct.py`.
 - Uniform grouped quantization lives in `mlwq/utils/mixed_quantizer.py`.
 - The GPTQ-compatible adapter lives in `mlwq/mlwq_gptq.py`.
@@ -25,7 +25,9 @@ The public upstream repository named in the paper does not include the custom `M
 Expected reproducible now:
 
 - Python imports and static compilation.
-- BPLL bit allocation under a fixed budget.
+- BPLL bit allocation under a fixed budget using activation distribution loss.
+- MQSA mixed bit-width application across non-salient, ordinary, and salient channels.
+- TQP-style clipping grid search per salience group.
 - WikiText2 loading and caching.
 - Small-model smoke runs for calibration, quantization, and PPL evaluation.
 
@@ -40,8 +42,28 @@ Not expected to reproduce exactly yet:
 1. Run `python -m py_compile mlwq/*.py mlwq/utils/*.py mlwq/model_utils/*.py`.
 2. Run `pytest tests`.
 3. Run a tiny OPT smoke test with `--nsamples 1`.
-4. Run the paper-like setting only after confirming CUDA memory availability:
+4. Run the FP16 baseline first, then the paper-like setting only after confirming CUDA memory availability:
 
 ```bash
+python -m mlwq.run facebook/opt-125m wikitext2 3bit --device cuda:0 --eval_fp16_only --nsamples 128 --groupsize 128 --run_name opt125_fp16 --save_metrics metrics/opt125_fp16.json
 python -m mlwq.run facebook/opt-125m wikitext2 3bit --device cuda:0 --nsamples 128 --groupsize 128
 ```
+
+For a staged reproduction with logs and JSON metrics:
+
+```bash
+bash mlwq/scripts/reproduce_opt.sh
+```
+
+With a 16 GB GPU, start with `facebook/opt-125m`. If that completes, try:
+
+```bash
+MODEL=facebook/opt-350m bash mlwq/scripts/reproduce_opt.sh
+```
+
+Reference PPL targets from the paper for context only:
+
+| Model | FP16 WikiText2 | MLWQ 3-bit WikiText2 |
+|---|---:|---:|
+| OPT-125M | 27.65 | 28.98 |
+| OPT-350M | 22.01 | 23.81 |
