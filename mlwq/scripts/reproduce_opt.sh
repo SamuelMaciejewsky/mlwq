@@ -14,7 +14,14 @@ MODEL_SLUG="${MODEL//\//_}"
 mkdir -p logs metrics
 
 python -V | tee logs/env.txt
-python -m pip freeze | tee -a logs/env.txt
+if python -m pip freeze >/tmp/mlwq-pip-freeze.txt 2>/tmp/mlwq-pip-freeze.err; then
+  cat /tmp/mlwq-pip-freeze.txt | tee -a logs/env.txt
+elif command -v uv >/dev/null 2>&1; then
+  uv pip freeze | tee -a logs/env.txt
+else
+  cat /tmp/mlwq-pip-freeze.err | tee -a logs/env.txt
+  echo "dependency freeze skipped: pip and uv are unavailable" | tee -a logs/env.txt
+fi
 if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi | tee logs/nvidia-smi.txt
 else
