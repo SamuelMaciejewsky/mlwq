@@ -39,10 +39,32 @@ Not expected to reproduce exactly yet:
 
 ## Suggested Validation Order
 
-1. Run `python -m py_compile mlwq/*.py mlwq/utils/*.py mlwq/model_utils/*.py`.
-2. Run `pytest tests`.
-3. Run a tiny OPT smoke test with `--nsamples 1`.
-4. Run the FP16 baseline first, then the paper-like setting only after confirming CUDA memory availability:
+From the standalone `mlwq` repository:
+
+```bash
+uv venv --python 3.10
+source .venv/bin/activate
+uv pip install -r mlwq/requirements.txt
+uv pip install -e .
+```
+
+From the parent research repository:
+
+```bash
+uv venv --python 3.10
+source .venv/bin/activate
+uv pip install -r mlwq/mlwq/requirements.txt
+uv pip install -e ./mlwq
+```
+
+The import name is `mlwq`; `wlmq` is a typo and is not provided by this
+package.
+
+1. Run `python -c "import mlwq.run; print(mlwq.run.__file__)"`.
+2. Run `python -m py_compile mlwq/*.py mlwq/utils/*.py mlwq/model_utils/*.py`.
+3. Run `pytest tests`.
+4. Run a tiny OPT smoke test with `--nsamples 1`.
+5. Run the FP16 baseline first, then the paper-like setting only after confirming CUDA memory availability:
 
 ```bash
 python -m mlwq.run facebook/opt-125m wikitext2 3bit --device cuda:0 --eval_fp16_only --nsamples 128 --groupsize 128 --run_name opt125_fp16 --save_metrics metrics/opt125_fp16.json

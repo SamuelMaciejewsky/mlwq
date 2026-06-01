@@ -22,11 +22,21 @@ cd mlwq
 uv venv --python 3.10
 source .venv/bin/activate
 uv pip install -r mlwq/requirements.txt
+uv pip install -e .
+```
+
+When working from the parent research repository, install the submodule in
+editable mode instead:
+
+```bash
+uv pip install -r mlwq/mlwq/requirements.txt
+uv pip install -e ./mlwq
 ```
 
 ## Verify
 
 ```bash
+python -c "import mlwq.run; print(mlwq.run.__file__)"
 python -m py_compile mlwq/*.py mlwq/utils/*.py mlwq/model_utils/*.py
 pytest tests
 ```
