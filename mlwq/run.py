@@ -1,13 +1,14 @@
-import time
 import json
 import platform
 import subprocess
+import time
 
 import torch
-import torch.nn as nn
 import tqdm
-from mlwq.mlwq_gptq import MLWQGPTQ
+from torch import nn
+
 from mlwq.bpll import compute_bit_assignments
+from mlwq.mlwq_gptq import MLWQGPTQ
 from mlwq.modelutils import find_layers
 from mlwq.utils.mixed_quantizer import Quantizer
 
@@ -35,8 +36,9 @@ def get_model(model):
             model.seqlen = 2048
         else:
             model.seqlen = 2048
-    elif "Smo" in model:
-        from transformers  import AutoModelForCausalLM
+    elif "Smo" or "gemma" in model:  # noqa: SIM222
+        from transformers import AutoModelForCausalLM
+        
         model = AutoModelForCausalLM.from_pretrained(model, torch_dtype="auto")
         print(model)
         model.seqlen=2048
@@ -66,7 +68,7 @@ def current_git_commit():
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return ""
 
 
@@ -254,7 +256,7 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
 
         def add_batch(name):
             def tmp(_, inp, out):
-                gptq[name].add_batch(inp[0].data, out.data)
+                gptq[name].add_batch(inp[0].data, out.data)  # noqa: B023, F821
 
             return tmp
 
@@ -326,10 +328,11 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
     return quantizers, mixed_block_precision
 
 def pack_model(model, save_path, bits, group_size, quantizers, block_bits):
-    import sys, os
+    import os
+    import sys
     sys.path.append(os.path.join(os.getcwd(), '../AutoGPTQ'))
   
-    from auto_gptq import LlamaGPTQForCausalLM, OPTGPTQForCausalLM, BaseQuantizeConfig
+    from auto_gptq import BaseQuantizeConfig, LlamaGPTQForCausalLM, OPTGPTQForCausalLM
     quantize_config = BaseQuantizeConfig(
         bits=bits,  
         group_size=group_size, 
@@ -341,7 +344,7 @@ def pack_model(model, save_path, bits, group_size, quantizers, block_bits):
     modified_block_bits = {}
     for k in block_bits:
         for name in block_bits[k]:
-            modified_block_bits['model.layers.%d.%s' % (k, name)] = torch.Tensor(block_bits[k][name]).int()
+            modified_block_bits['model.layers.%d.%s' % (k, name)] = torch.Tensor(block_bits[k][name]).int()  # noqa: UP031
 
     if "llama" in args.model:
         model = LlamaGPTQForCausalLM(model, quantized=False, quantize_config=quantize_config)

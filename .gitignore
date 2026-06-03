@@ -5,3 +5,6 @@ __pycache__/
 cache/
 output/
 block_precision_*/
+mlwq_repro.egg-info/
+logs/
+metrics/
