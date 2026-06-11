@@ -1,13 +1,62 @@
+import json
+import platform
+import subprocess
 import time
 
 import torch
-import torch.nn as nn
 import tqdm
-from mlwq.mlwq_gptq import MLWQGPTQ
-from utils.mixed_quantizer import Quantizer
-from modelutils import find_layers
-import itertools
+from torch import nn
 
+from mlwq.bpll import compute_bit_assignments
+from mlwq.mlwq_gptq import MLWQGPTQ
+from mlwq.modelutils import find_layers
+from mlwq.utils.mixed_quantizer import Quantizer
+
+
+def get_optimal_dtype():
+    if not torch.cuda.is_available():
+        print("CUDA not available")
+        print("Running on CPU with Dtype=FP32")
+
+        return torch.float32
+
+    gpu_name   = torch.cuda.get_device_name(0)
+    capability = torch.cuda.get_device_capability(0)
+    vram_gb    = torch.cuda.get_device_properties(0).total_memory // 1e9
+
+    print(f"GPU Name: {gpu_name}")
+    print(f"GPU capability: {capability[0]}")
+    print(f"GPU VRAM: {vram_gb}GB")
+
+    if capability[0] >= 10:
+        print("Using Blackwell architecture")
+        print("Running on GPU with Dtype=BF16")
+
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        return torch.bfloat16
+
+    if capability[0] >= 8:
+        print("Using Ampere/Ada architecture")
+        print("Running on GPU with Dtype=BF16")
+
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        return torch.bfloat16
+
+    if capability[0] >= 7:
+        print("Using Turing/Volta architecture")
+        print("Running on GPU with Dtype=FP16")
+        
+        return torch.float16
+
+    # For older GPU's, the FP32 are not natively supported
+    print("Using an older GPU architecture")
+    print("Running on GPU with Dtype=FP32")
+
+    return torch.float32
 
 def get_model(model):
     import torch
@@ -19,70 +68,95 @@ def get_model(model):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     name = model
+    dtype = get_optimal_dtype()
     if "opt" in model:
         from transformers import OPTForCausalLM
 
-        model = OPTForCausalLM.from_pretrained(model, torch_dtype="auto")
+        model = OPTForCausalLM.from_pretrained(model, torch_dtype=dtype)
         model.seqlen = model.config.max_position_embeddings
     elif "llama" in model:
         from transformers import LlamaForCausalLM
        
-        model = LlamaForCausalLM.from_pretrained(model, torch_dtype="auto")
+        model = LlamaForCausalLM.from_pretrained(model, torch_dtype=dtype)
         if "llama-3" in name.lower():
             model.seqlen = 2048
         else:
             model.seqlen = 2048
-    elif "Smo" in model:
-        from transformers  import AutoModelForCausalLM
-        model = AutoModelForCausalLM.from_pretrained(model, torch_dtype="auto")
+    elif "Smo" or "gemma" in model:  # noqa: SIM222
+        from transformers import AutoModelForCausalLM
+        
+        model = AutoModelForCausalLM.from_pretrained(model, torch_dtype=dtype)
         print(model)
         model.seqlen=2048
+
     return model
 
-def find_best_bitwidth_combination(average_errors,gptq, bit_options, num_sublayers, target_total):
-    all_combinations = list(itertools.product(bit_options, repeat=num_sublayers))
- 
-    min_total_error=100000000
-    for comb in all_combinations:
-        count_of_ones = comb.count(1)
-    
-        if sum(comb) == target_total and count_of_ones==0:  
-            total_error = 0.0
-         
-            for i, bit_width in enumerate(comb):
-                total_error += average_errors[i][bit_width - 2]  
-              
-            if total_error < min_total_error:
-                min_total_error = total_error
-                best_combination = comb
+def bit_options_for_target(target_bits):
+    target_bits = int(target_bits)
+    if target_bits <= 2:
+        return (2, 3), 2
+    if target_bits == 3:
+        return (2, 3), 3
+    return (target_bits - 1, target_bits), target_bits
 
 
-    return best_combination,min_total_error
+def salience_ratios_for_bits(bits):
+    if int(bits) <= 2:
+        return 0.02, 0.10
+    if int(bits) == 3:
+        return 0.05, 0.05
+    return 0.10, 0.02
 
-  
+
+def current_git_commit():
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def cuda_metrics_for_device(device):
+    metric_device = torch.device(device)
+    if not (torch.cuda.is_available() and metric_device.type == "cuda"):
+        return {}
+
+    device_index = metric_device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    properties = torch.cuda.get_device_properties(device_index)
+    return {
+        "cuda_available": True,
+        "gpu": torch.cuda.get_device_name(device_index),
+        "gpu_memory_total_gb": round(properties.total_memory / (1024 ** 3), 2),
+    }
+
 
 def compute_bit(gptq):
-    average_errors=[]
-    suma=0
-    sumx=0
-    for name, sublayer in gptq.items():
-    
-        zipped = zip(*sublayer.block_errors)
-        average_error = [np.mean(item) for item in zipped]
-        average_errors.append(average_error)
-       
-    best_combination, min_total_error = find_best_bitwidth_combination(average_errors,gptq, bit_options=[2,3], num_sublayers=7, target_total=20)
-    best_combinations={}
-  
-    for index,(name, sublayer) in enumerate(gptq.items()):
-        
-        best_combinations[name] = best_combination[index]
-        
-    return  best_combinations
+    requested_bits = int(args.low_quant_method[0])
+    bit_options, target_average = bit_options_for_target(requested_bits)
+    layer_sizes = {
+        name: int(sublayer.layer.weight.data.numel())
+        for name, sublayer in gptq.items()
+    }
+    target_total = target_average * sum(layer_sizes.values())
+    if len(gptq) > 1 and target_average > min(bit_options):
+        target_total -= min(layer_sizes.values())
+    best_combinations, min_total_error = compute_bit_assignments(
+        gptq,
+        bit_options=bit_options,
+        target_total=target_total,
+        layer_sizes=layer_sizes,
+    )
+    print("BPLL min total error:", min_total_error)
+    return best_combinations
 
 
 @torch.no_grad()
-def quant_sequential(model, dataloader, dev, saved_block_precision):
+def quant_sequential(model, dataloader, dev, saved_block_precision, keep_on_gpu=False):
  
 
     for name, module in model.named_modules():
@@ -145,25 +219,26 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
             pass
     layers[0] = layers[0].module
 
-    layers[0] = layers[0].cpu()
-    if "opt" in args.model:
-        model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
-        model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
-        if (
-            hasattr(model.model.decoder, "project_out")
-            and model.model.decoder.project_out
-        ):
-            model.model.decoder.project_out = model.model.decoder.project_out.cpu()
-        if (
-            hasattr(model.model.decoder, "project_in")
-            and model.model.decoder.project_in
-        ):
-            model.model.decoder.project_in = model.model.decoder.project_in.cpu()
-    elif "llama" in args.model or "Smo" in args.model:
-        model.model.embed_tokens = model.model.embed_tokens.cpu()
-        model.model.norm = model.model.norm.cpu()
-        model.model.rotary_emb=model.model.rotary_emb.cpu()
-    torch.cuda.empty_cache()
+    if not keep_on_gpu:
+        layers[0] = layers[0].cpu()
+        if "opt" in args.model:
+            model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
+            model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
+            if (
+                hasattr(model.model.decoder, "project_out")
+                and model.model.decoder.project_out
+            ):
+                model.model.decoder.project_out = model.model.decoder.project_out.cpu()
+            if (
+                hasattr(model.model.decoder, "project_in")
+                and model.model.decoder.project_in
+            ):
+                model.model.decoder.project_in = model.model.decoder.project_in.cpu()
+        elif "llama" in args.model or "Smo" in args.model:
+            model.model.embed_tokens = model.model.embed_tokens.cpu()
+            model.model.norm = model.model.norm.cpu()
+            model.model.rotary_emb=model.model.rotary_emb.cpu()
+        torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
@@ -171,6 +246,7 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
         position_ids = cache["position_ids"]
 
     print("Ready.")
+    bpll_bit_options, _ = bit_options_for_target(int(args.low_quant_method[0]))
     index = 0
     mixed_block_precision = {}
     quantizers = {}
@@ -178,12 +254,9 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
 
     for i in tqdm.tqdm(range(len(layers)), desc="Running Mixed-Precision Quantization"):
         layer = layers[i].to(dev)
-       
-    
-
         subset = find_layers(layer)
-
         gptq = {}
+
         for name in subset:
             index += 1
           
@@ -201,12 +274,34 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
             gptq[name] = MLWQGPTQ(
                 subset[name],
                 quantizer,
-                bit_width = int(args.low_quant_method[0])
+                bit_width = int(args.low_quant_method[0]),
+                bpll_loss=args.bpll_loss,
+                tqp_grid=args.tqp_grid,
+                hessian_mode=args.hessian_mode,
+                hessian_full_threshold=args.hessian_full_threshold,
+                bit_options=bpll_bit_options,
+            )
+
+        if not gptq:
+            if not (args.minlayer <= i < args.maxlayer) and not args.invert:
+                for j in range(args.nsamples):
+                    if "opt" in args.model:
+                        outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                    else:
+                        outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                layers[i] = layer.cpu()
+                del layer
+                torch.cuda.empty_cache()
+                inps, outs = outs, inps
+                continue
+            raise ValueError(
+                f"no quantizable sublayers selected in layer {i}; "
+                "check --quant_only/--minlayer/--maxlayer/--invert"
             )
 
         def add_batch(name):
             def tmp(_, inp, out):
-                gptq[name].add_batch(inp[0].data, out.data)
+                gptq[name].add_batch(inp[0].data, out.data)  # noqa: B023, F821
 
             return tmp
 
@@ -231,22 +326,10 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
         sumc=0
         
 
-        for name in gptq:
-            
-            if best_combinations[name]==2:
-               
-                if subset[name].weight.data.shape[1]==8192:
-                    gptq[name].get_salience1(name,i,6,1364,blocksize=args.groupsize)
-                    
-                else:
-                    gptq[name].get_salience1(name,i,6,511,blocksize=args.groupsize)
-              
-                sv+=best_combinations[name]*subset[name].weight.data.shape[0]*(subset[name].weight.data.shape[1]-100)+3*subset[name].weight.data.shape[0]*50+4*subset[name].weight.data.shape[0]*50  
-            else:
-                gptq[name].get_salience(name,i,1,blocksize=args.groupsize)
-                sv+=best_combinations[name]*subset[name].weight.data.shape[0]*(subset[name].weight.data.shape[1]-100)+2*subset[name].weight.data.shape[0]*50+4*subset[name].weight.data.shape[0]*50          
-                 
-           
+        for name in gptq:  # noqa: PLC0206
+            high_ratio, low_ratio = salience_ratios_for_bits(best_combinations[name])
+            gptq[name].get_salience1(name, i, high_ratio, low_ratio, blocksize=args.groupsize)
+            sv+=best_combinations[name]*subset[name].weight.data.shape[0]*subset[name].weight.data.shape[1]
             sumc+=subset[name].weight.data.shape[0]*subset[name].weight.data.shape[1]
         sv=sv/sumc 
         
@@ -256,7 +339,7 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
      
         mixed_block_precision[i] = {}
         
-        for name in gptq:
+        for name in gptq:  # noqa: PLC0206
             print(i, name)
             print("Quantizing ...")
             layer_block_precision, scales, zeros, g_idx = gptq[name].fasterquant1(
@@ -267,6 +350,7 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
                 saved_block_precision=saved_block_precision[i][name] if (saved_block_precision is not None) else None,
             )
             mixed_block_precision[i][name] = layer_block_precision
+            quantizers[f"model.layers.{i}.{name}"] = (scales, zeros, g_idx)
 
 
             gptq[name].free()
@@ -277,22 +361,24 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
             else:
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
 
-        layers[i] = layer.cpu()
-        del layer
-        del gptq
-        torch.cuda.empty_cache()
+        if not keep_on_gpu:
+            layers[i] = layer.cpu()
+            del layer
+            torch.cuda.empty_cache()
 
         inps, outs = outs, inps
+        del gptq
   
    
     model.config.use_cache = use_cache
-    return quantizers
+    return quantizers, mixed_block_precision
 
 def pack_model(model, save_path, bits, group_size, quantizers, block_bits):
-    import sys, os
+    import os
+    import sys
     sys.path.append(os.path.join(os.getcwd(), '../AutoGPTQ'))
   
-    from auto_gptq import LlamaGPTQForCausalLM, OPTGPTQForCausalLM, BaseQuantizeConfig
+    from auto_gptq import BaseQuantizeConfig, LlamaGPTQForCausalLM, OPTGPTQForCausalLM
     quantize_config = BaseQuantizeConfig(
         bits=bits,  
         group_size=group_size, 
@@ -304,7 +390,7 @@ def pack_model(model, save_path, bits, group_size, quantizers, block_bits):
     modified_block_bits = {}
     for k in block_bits:
         for name in block_bits[k]:
-            modified_block_bits['model.layers.%d.%s' % (k, name)] = torch.Tensor(block_bits[k][name]).int()
+            modified_block_bits['model.layers.%d.%s' % (k, name)] = torch.Tensor(block_bits[k][name]).int()  # noqa: UP031
 
     if "llama" in args.model:
         model = LlamaGPTQForCausalLM(model, quantized=False, quantize_config=quantize_config)
@@ -318,7 +404,9 @@ def pack_model(model, save_path, bits, group_size, quantizers, block_bits):
 
 if __name__ == "__main__":
     import argparse
-    from datautils import *
+    import os
+
+    from mlwq.datautils import get_loaders
 
     def list_of_ints(arg):
         return list(map(int, arg.split(',')))
@@ -426,15 +514,94 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pack", action="store_true", help="Whether to save the packed model."
     )
+    parser.add_argument(
+        "--eval_fp16_only", action="store_true", help="Skip quantization and only evaluate FP16 PPL."
+    )
+    parser.add_argument(
+        "--bpll_loss",
+        type=str,
+        default="activation_dist",
+        choices=["activation_dist", "weight_mse"],
+        help="Loss used by BPLL when ranking bit-width choices.",
+    )
+    parser.add_argument(
+        "--tqp_grid",
+        type=list_of_floats,
+        default=[1.0, 0.95, 0.9, 0.85],
+        help="Comma-separated clipping ratios for TQP grid search.",
+    )
+    parser.add_argument(
+        "--hessian_mode",
+        type=str,
+        default="diag",
+        choices=["diag", "full"],
+        help="Use diagonal Hessian approximation or full inverse-Hessian diagonal when small enough.",
+    )
+    parser.add_argument(
+        "--hessian_full_threshold",
+        type=int,
+        default=1024,
+        help="Maximum input dimension for full Hessian inverse in salience.",
+    )
+    parser.add_argument(
+        "--torch_compile",
+        action="store_true",
+        help="Use torch.compile for optimization (Pytorch 2.0+)"
+    )
+    parser.add_argument(
+        "--keep_on_gpu",
+        action="store_true",
+        help="Keep model on GPU during evaluation (faster but uses more VRAM)"
+    )
+    parser.add_argument(
+        "--compile_mode",
+        type=str,
+        default="reduce-overhead",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        help="Torch compile modes"
+    )
+    parser.add_argument(
+        "--run_name",
+        type=str, default="", 
+        help="Name used in metrics output."    
+    )
+    parser.add_argument(
+        "--save_metrics",
+        type=str,
+        default="",
+        help="Path to a JSON metrics file."
+    )
+    parser.add_argument(
+        "--watch_performance",
+        action="store_true",
+        help="Enable performance monitoring (GPU, VRAM, CPU, RAM usage)."
+    )
+    parser.add_argument(
+        "--watch_interval",
+        type=float,
+        default=0.5,
+        help="Sampling interval for performance monitoring in seconds (default: 0.5)."
+    )
 
     args = parser.parse_args()
-   
 
-   
+    # Performance monitoring setup
+    perf_monitor = None
+    if args.watch_performance:
+        from mlwq.utils.watch_performance import PerformanceMonitor
+
+        perf_monitor = PerformanceMonitor(
+            sampling_interval=args.watch_interval,
+            device=args.device,
+        )
+        perf_monitor.start()
+
     groupsize = args.groupsize
     net = args.model.split("/")[-1]
     block_configurations = f'../block_precision_{args.groupsize}_{args.low_quant_method}/{net}.pt'
-    if os.path.exists(block_configurations):
+    if args.eval_fp16_only:
+        block_precision = None
+    elif os.path.exists(block_configurations):
         block_precision = torch.load(block_configurations)
     else:
         print(f'Block precisions of {net} does not exist. Start aware!')
@@ -445,25 +612,64 @@ if __name__ == "__main__":
   
     save_title = f"{args.model}_{args.dataset}_{args.low_quant_method}_{groupsize}"
     save_file = "./output/" + save_title.replace("/", "_") + ".pt"
+    quantizers = {}
+    mixed_block_precision = {}
+    metrics = {
+        "run_name": args.run_name,
+        "model": args.model,
+        "dataset": args.dataset,
+        "low_quant_method": args.low_quant_method,
+        "seed": args.seed,
+        "nsamples": args.nsamples,
+        "groupsize": args.groupsize,
+        "device": args.device,
+        "bpll_loss": args.bpll_loss,
+        "tqp_grid": args.tqp_grid,
+        "hessian_mode": args.hessian_mode,
+        "hessian_full_threshold": args.hessian_full_threshold,
+        "eval_fp16_only": args.eval_fp16_only,
+        "quantized": False,
+        "git_commit": current_git_commit(),
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+    }
+    metrics.update(cuda_metrics_for_device(device))
+
     if args.load_quantized:
         model = get_model(save_file)
         model.eval()
     else:
         model = get_model(args.model)
         model.eval()
+        if not args.eval_fp16_only:
+            tick = time.time()
+            dataloader, testloader = get_loaders(
+                args.dataset,
+                nsamples=args.nsamples,
+                seed=args.seed, 
+                model=args.model,
+                seqlen=model.seqlen,
+            )
+            quantizers, mixed_block_precision = quant_sequential(model, dataloader, device, block_precision, keep_on_gpu=args.keep_on_gpu)
+            metrics["quantization_time_s"] = time.time() - tick
+            metrics["quantized"] = True
+            print("quantization time:", metrics["quantization_time_s"], "s")
+
+    if args.torch_compile:
+        print(f"Compiling in {args.compile_mode} mode")
+        import time
         tick = time.time()
-     
-        dataloader, testloader = get_loaders(
-            args.dataset,
-            nsamples=args.nsamples,
-            seed=args.seed,
-            model=args.model,
-            seqlen=model.seqlen,
-        )
-       
-        quantizers = quant_sequential(model, dataloader, device, block_precision)
-        print("quantization time:", time.time() - tick, "s")
-   
+        try:
+            model = torch.compile(model, mode=args.compile_mode)
+            warmup_time = time.time() - tick
+            print(f"Compilation completed in {warmup_time:.2f}s")
+            metrics["compile_time_s"] = warmup_time
+        except Exception as e:  # noqa: BLE001
+            print(f"Compile failed: {e}")
+            print("Continuing without compilation")
+
+    metrics["model_seqlen"] = getattr(model, "seqlen", None)
     
     for dataset in ["wikitext2"]:
         dataloader, testloader = get_loaders(
@@ -471,25 +677,46 @@ if __name__ == "__main__":
         )
         print(dataset)
         if "opt" in args.model:
-            from eval_ppl_utils import opt_eval
-
-            opt_eval(model, testloader, device, dataset, args.log_wandb)
+            from mlwq.eval_ppl_utils import opt_eval
+            # To reduce the processing load on GPU, use keep_on_gpu=false
+            metrics[f"{dataset}_ppl"] = opt_eval(model, testloader, device, dataset, args.log_wandb, keep_on_gpu=args.keep_on_gpu)
         elif "llama" in args.model or "Smo" in args.model:
-            from eval_ppl_utils import llama_eval
-
-            llama_eval(model, testloader, device, dataset, args.log_wandb)
+            from mlwq.eval_ppl_utils import llama_eval
+            # To reduce the processing load on GPU, use keep_on_gpu=false
+            metrics[f"{dataset}_ppl"] = llama_eval(model, testloader, device, dataset, args.log_wandb, keep_on_gpu=args.keep_on_gpu)
     if args.tasks != "":
-        from eval_ppl_utils import zeroshot_evaluate
+        from mlwq.eval_ppl_utils import zeroshot_evaluate
         zeroshot_evaluate(model, args)
 
     if args.save:
       
         if args.pack:
+            if not quantizers:
+                raise RuntimeError("--pack requires quantization metadata from a fresh run")
             bits = int(args.low_quant_method[0])
-            pack_model(model, save_file, bits, groupsize, quantizers, block_precision)
+            block_bits = block_precision if block_precision is not None else mixed_block_precision
+            pack_model(model, save_file, bits, groupsize, quantizers, block_bits)
        
         else:
             save_path = os.path.dirname(save_file)
             if not os.path.exists(save_path):
                 os.makedirs(save_path)
             model.save_pretrained(save_file)
+
+    if args.save_metrics:
+        metrics_path = args.save_metrics
+        metrics_dir = os.path.dirname(metrics_path)
+        if metrics_dir and not os.path.exists(metrics_dir):
+            os.makedirs(metrics_dir)
+
+        # Add performance monitoring summary if available
+        if perf_monitor:
+            summary = perf_monitor.get_summary()
+            metrics["performance_monitoring"] = summary
+
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2, sort_keys=True)
+
+    # Stop performance monitoring
+    if perf_monitor:
+        perf_monitor.stop()
