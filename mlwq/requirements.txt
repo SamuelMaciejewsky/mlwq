@@ -24,3 +24,9 @@ transformers==4.46.1
 datasets==2.19.1
 lm-eval==0.4.2
 huggingface-hub==0.36.2
+
+# Performance monitoring dependencies
+matplotlib==3.9.0
+nvidia-ml-py==12.535.133
+polars==1.6.0
+psutil==6.0.0

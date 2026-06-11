@@ -13,4 +13,6 @@ class LMClass:
                 "lm_eval.models.huggingface.HFLM is unavailable. "
                 "Install a compatible lm-eval version or run without --tasks."
             )
-        return HFLM(pretrained=model, tokenizer=getattr(args, "model", None), device=args.device)
+        # lm_eval 0.4+ expects the model object, not a string name
+        # Pass the model directly and let lm_eval handle it
+        return HFLM(pretrained=model, device=args.device)

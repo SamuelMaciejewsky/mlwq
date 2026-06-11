@@ -31,7 +31,7 @@ class MLWQGPTQ:
         self.tqp_grid = tqp_grid or (1.0, 0.95, 0.9, 0.85)
         self.hessian_mode = hessian_mode
         self.hessian_full_threshold = int(hessian_full_threshold)
-        self.bit_options = tuple(sorted(set(int(bit) for bit in bit_options)))
+        self.bit_options = tuple(sorted({int(bit) for bit in bit_options}))
         self.block_errors = []
         self.hessian_diag = None
         self.hessian = None

@@ -13,6 +13,51 @@ from mlwq.modelutils import find_layers
 from mlwq.utils.mixed_quantizer import Quantizer
 
 
+def get_optimal_dtype():
+    if not torch.cuda.is_available():
+        print("CUDA not available")
+        print("Running on CPU with Dtype=FP32")
+
+        return torch.float32
+
+    gpu_name   = torch.cuda.get_device_name(0)
+    capability = torch.cuda.get_device_capability(0)
+    vram_gb    = torch.cuda.get_device_properties(0).total_memory // 1e9
+
+    print(f"GPU Name: {gpu_name}")
+    print(f"GPU capability: {capability[0]}")
+    print(f"GPU VRAM: {vram_gb}GB")
+
+    if capability[0] >= 10:
+        print("Using Blackwell architecture")
+        print("Running on GPU with Dtype=BF16")
+
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        return torch.bfloat16
+
+    if capability[0] >= 8:
+        print("Using Ampere/Ada architecture")
+        print("Running on GPU with Dtype=BF16")
+
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        return torch.bfloat16
+
+    if capability[0] >= 7:
+        print("Using Turing/Volta architecture")
+        print("Running on GPU with Dtype=FP16")
+        
+        return torch.float16
+
+    # For older GPU's, the FP32 are not natively supported
+    print("Using an older GPU architecture")
+    print("Running on GPU with Dtype=FP32")
+
+    return torch.float32
+
 def get_model(model):
     import torch
 
@@ -23,15 +68,16 @@ def get_model(model):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     name = model
+    dtype = get_optimal_dtype()
     if "opt" in model:
         from transformers import OPTForCausalLM
 
-        model = OPTForCausalLM.from_pretrained(model, torch_dtype="auto")
+        model = OPTForCausalLM.from_pretrained(model, torch_dtype=dtype)
         model.seqlen = model.config.max_position_embeddings
     elif "llama" in model:
         from transformers import LlamaForCausalLM
        
-        model = LlamaForCausalLM.from_pretrained(model, torch_dtype="auto")
+        model = LlamaForCausalLM.from_pretrained(model, torch_dtype=dtype)
         if "llama-3" in name.lower():
             model.seqlen = 2048
         else:
@@ -39,9 +85,10 @@ def get_model(model):
     elif "Smo" or "gemma" in model:  # noqa: SIM222
         from transformers import AutoModelForCausalLM
         
-        model = AutoModelForCausalLM.from_pretrained(model, torch_dtype="auto")
+        model = AutoModelForCausalLM.from_pretrained(model, torch_dtype=dtype)
         print(model)
         model.seqlen=2048
+
     return model
 
 def bit_options_for_target(target_bits):
@@ -109,7 +156,7 @@ def compute_bit(gptq):
 
 
 @torch.no_grad()
-def quant_sequential(model, dataloader, dev, saved_block_precision):
+def quant_sequential(model, dataloader, dev, saved_block_precision, keep_on_gpu=False):
  
 
     for name, module in model.named_modules():
@@ -172,25 +219,26 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
             pass
     layers[0] = layers[0].module
 
-    layers[0] = layers[0].cpu()
-    if "opt" in args.model:
-        model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
-        model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
-        if (
-            hasattr(model.model.decoder, "project_out")
-            and model.model.decoder.project_out
-        ):
-            model.model.decoder.project_out = model.model.decoder.project_out.cpu()
-        if (
-            hasattr(model.model.decoder, "project_in")
-            and model.model.decoder.project_in
-        ):
-            model.model.decoder.project_in = model.model.decoder.project_in.cpu()
-    elif "llama" in args.model or "Smo" in args.model:
-        model.model.embed_tokens = model.model.embed_tokens.cpu()
-        model.model.norm = model.model.norm.cpu()
-        model.model.rotary_emb=model.model.rotary_emb.cpu()
-    torch.cuda.empty_cache()
+    if not keep_on_gpu:
+        layers[0] = layers[0].cpu()
+        if "opt" in args.model:
+            model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
+            model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
+            if (
+                hasattr(model.model.decoder, "project_out")
+                and model.model.decoder.project_out
+            ):
+                model.model.decoder.project_out = model.model.decoder.project_out.cpu()
+            if (
+                hasattr(model.model.decoder, "project_in")
+                and model.model.decoder.project_in
+            ):
+                model.model.decoder.project_in = model.model.decoder.project_in.cpu()
+        elif "llama" in args.model or "Smo" in args.model:
+            model.model.embed_tokens = model.model.embed_tokens.cpu()
+            model.model.norm = model.model.norm.cpu()
+            model.model.rotary_emb=model.model.rotary_emb.cpu()
+        torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
@@ -206,12 +254,9 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
 
     for i in tqdm.tqdm(range(len(layers)), desc="Running Mixed-Precision Quantization"):
         layer = layers[i].to(dev)
-       
-    
-
         subset = find_layers(layer)
-
         gptq = {}
+
         for name in subset:
             index += 1
           
@@ -281,7 +326,7 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
         sumc=0
         
 
-        for name in gptq:
+        for name in gptq:  # noqa: PLC0206
             high_ratio, low_ratio = salience_ratios_for_bits(best_combinations[name])
             gptq[name].get_salience1(name, i, high_ratio, low_ratio, blocksize=args.groupsize)
             sv+=best_combinations[name]*subset[name].weight.data.shape[0]*subset[name].weight.data.shape[1]
@@ -294,7 +339,7 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
      
         mixed_block_precision[i] = {}
         
-        for name in gptq:
+        for name in gptq:  # noqa: PLC0206
             print(i, name)
             print("Quantizing ...")
             layer_block_precision, scales, zeros, g_idx = gptq[name].fasterquant1(
@@ -316,12 +361,13 @@ def quant_sequential(model, dataloader, dev, saved_block_precision):
             else:
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
 
-        layers[i] = layer.cpu()
-        del layer
-        del gptq
-        torch.cuda.empty_cache()
+        if not keep_on_gpu:
+            layers[i] = layer.cpu()
+            del layer
+            torch.cuda.empty_cache()
 
         inps, outs = outs, inps
+        del gptq
   
    
     model.config.use_cache = use_cache
@@ -497,13 +543,59 @@ if __name__ == "__main__":
         default=1024,
         help="Maximum input dimension for full Hessian inverse in salience.",
     )
-    parser.add_argument("--run_name", type=str, default="", help="Name used in metrics output.")
-    parser.add_argument("--save_metrics", type=str, default="", help="Path to a JSON metrics file.")
+    parser.add_argument(
+        "--torch_compile",
+        action="store_true",
+        help="Use torch.compile for optimization (Pytorch 2.0+)"
+    )
+    parser.add_argument(
+        "--keep_on_gpu",
+        action="store_true",
+        help="Keep model on GPU during evaluation (faster but uses more VRAM)"
+    )
+    parser.add_argument(
+        "--compile_mode",
+        type=str,
+        default="reduce-overhead",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        help="Torch compile modes"
+    )
+    parser.add_argument(
+        "--run_name",
+        type=str, default="", 
+        help="Name used in metrics output."    
+    )
+    parser.add_argument(
+        "--save_metrics",
+        type=str,
+        default="",
+        help="Path to a JSON metrics file."
+    )
+    parser.add_argument(
+        "--watch_performance",
+        action="store_true",
+        help="Enable performance monitoring (GPU, VRAM, CPU, RAM usage)."
+    )
+    parser.add_argument(
+        "--watch_interval",
+        type=float,
+        default=0.5,
+        help="Sampling interval for performance monitoring in seconds (default: 0.5)."
+    )
 
     args = parser.parse_args()
-   
 
-   
+    # Performance monitoring setup
+    perf_monitor = None
+    if args.watch_performance:
+        from mlwq.utils.watch_performance import PerformanceMonitor
+
+        perf_monitor = PerformanceMonitor(
+            sampling_interval=args.watch_interval,
+            device=args.device,
+        )
+        perf_monitor.start()
+
     groupsize = args.groupsize
     net = args.model.split("/")[-1]
     block_configurations = f'../block_precision_{args.groupsize}_{args.low_quant_method}/{net}.pt'
@@ -555,16 +647,29 @@ if __name__ == "__main__":
             dataloader, testloader = get_loaders(
                 args.dataset,
                 nsamples=args.nsamples,
-                seed=args.seed,
+                seed=args.seed, 
                 model=args.model,
                 seqlen=model.seqlen,
             )
-            quantizers, mixed_block_precision = quant_sequential(model, dataloader, device, block_precision)
+            quantizers, mixed_block_precision = quant_sequential(model, dataloader, device, block_precision, keep_on_gpu=args.keep_on_gpu)
             metrics["quantization_time_s"] = time.time() - tick
             metrics["quantized"] = True
             print("quantization time:", metrics["quantization_time_s"], "s")
+
+    if args.torch_compile:
+        print(f"Compiling in {args.compile_mode} mode")
+        import time
+        tick = time.time()
+        try:
+            model = torch.compile(model, mode=args.compile_mode)
+            warmup_time = time.time() - tick
+            print(f"Compilation completed in {warmup_time:.2f}s")
+            metrics["compile_time_s"] = warmup_time
+        except Exception as e:  # noqa: BLE001
+            print(f"Compile failed: {e}")
+            print("Continuing without compilation")
+
     metrics["model_seqlen"] = getattr(model, "seqlen", None)
-   
     
     for dataset in ["wikitext2"]:
         dataloader, testloader = get_loaders(
@@ -573,12 +678,12 @@ if __name__ == "__main__":
         print(dataset)
         if "opt" in args.model:
             from mlwq.eval_ppl_utils import opt_eval
-
-            metrics[f"{dataset}_ppl"] = opt_eval(model, testloader, device, dataset, args.log_wandb)
+            # To reduce the processing load on GPU, use keep_on_gpu=false
+            metrics[f"{dataset}_ppl"] = opt_eval(model, testloader, device, dataset, args.log_wandb, keep_on_gpu=args.keep_on_gpu)
         elif "llama" in args.model or "Smo" in args.model:
             from mlwq.eval_ppl_utils import llama_eval
-
-            metrics[f"{dataset}_ppl"] = llama_eval(model, testloader, device, dataset, args.log_wandb)
+            # To reduce the processing load on GPU, use keep_on_gpu=false
+            metrics[f"{dataset}_ppl"] = llama_eval(model, testloader, device, dataset, args.log_wandb, keep_on_gpu=args.keep_on_gpu)
     if args.tasks != "":
         from mlwq.eval_ppl_utils import zeroshot_evaluate
         zeroshot_evaluate(model, args)
@@ -603,5 +708,15 @@ if __name__ == "__main__":
         metrics_dir = os.path.dirname(metrics_path)
         if metrics_dir and not os.path.exists(metrics_dir):
             os.makedirs(metrics_dir)
+
+        # Add performance monitoring summary if available
+        if perf_monitor:
+            summary = perf_monitor.get_summary()
+            metrics["performance_monitoring"] = summary
+
         with open(metrics_path, "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2, sort_keys=True)
+
+    # Stop performance monitoring
+    if perf_monitor:
+        perf_monitor.stop()
