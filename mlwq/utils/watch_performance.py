@@ -6,7 +6,6 @@ All metrics plotted together vs execution time.
 """
 
 import json
-import os
 import threading
 import time
 from datetime import datetime
@@ -167,7 +166,7 @@ class PerformanceMonitor:
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
         data = np.array(self._data)
-        times = data[:, 0]
+        data[:, 0]
 
         # Save CSV
         try:
@@ -183,8 +182,7 @@ class PerformanceMonitor:
             # Fallback to manual CSV
             with open(self.run_dir / "metrics.csv", "w") as f:
                 f.write("time_s,gpu_usage_pct,vram_usage_pct,cpu_usage_pct,ram_usage_pct\n")
-                for row in self._data:
-                    f.write(f"{row[0]:.4f},{row[1]:.2f},{row[2]:.2f},{row[3]:.2f},{row[4]:.2f}\n")
+                f.writelines(f"{row[0]:.4f},{row[1]:.2f},{row[2]:.2f},{row[3]:.2f},{row[4]:.2f}\n" for row in self._data)
 
         # Save JSON
         json_data = {
@@ -270,7 +268,7 @@ class PerformanceMonitor:
 class MonitorContext:
     """Context manager for performance monitoring."""
 
-    def __init__(self, output_dir: str = None, sampling_interval: float = 0.5, device: str = "cuda:0"):
+    def __init__(self, output_dir: str | None = None, sampling_interval: float = 0.5, device: str = "cuda:0"):
         self.monitor = PerformanceMonitor(
             output_dir=output_dir,
             sampling_interval=sampling_interval,

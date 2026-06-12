@@ -79,7 +79,7 @@ EXEMPLOS:
   --eval_fp16_only       Apenas avaliação FP16 (pula quantização)
 
 ─────────────────────────────────────────────────────────────────────────────
- 5. FLAGS DE SAÍDA                                                           
+ 5. FLAGS DE SAÍDA
 ─────────────────────────────────────────────────────────────────────────────
 
   --save                 Salvar modelo quantizado
@@ -87,15 +87,23 @@ EXEMPLOS:
   --pack                 Empacotar modelo para AutoGPTQ
 
   --save_metrics         Caminho para salvar métricas JSON
-                        Exemplo: --save_metrics metrics/meu_run.json
+                        Inclui dados de --watch_performance se usado
 
   --run_name             Nome para identificar a execução
-                        Exemplo: --run_name "llama-3b-test-1"
 
   --log_wandb            Habilitar logging no Weights & Biases
 
 ─────────────────────────────────────────────────────────────────────────────
- 6. FLAGS DE CONTROLE                                                        
+ 6. MONITORAMENTO DE PERFORMANCE
+─────────────────────────────────────────────────────────────────────────────
+
+  --watch_performance    Monitora GPU, VRAM, CPU e RAM durante execução
+                        Salva em metrics/watch_performance/ (CSV, JSON, PNG)
+
+  --watch_interval       Intervalo de amostragem em segundos (default: 0.5)
+
+─────────────────────────────────────────────────────────────────────────────
+ 7. FLAGS DE CONTROLE                                                        
 ─────────────────────────────────────────────────────────────────────────────
 
   --seed                Semente para reproducibilidade (default: 0)
@@ -111,7 +119,7 @@ EXEMPLOS:
   --load_quantized       Carrega modelo já quantizado
 
 ─────────────────────────────────────────────────────────────────────────────
- 7. SCRIPTS DISPONÍVEIS                                                      
+ 8. SCRIPTS DISPONÍVEIS                                                      
 ─────────────────────────────────────────────────────────────────────────────
 
   ./run-llamaModel.sh    [flags]
@@ -133,7 +141,7 @@ EXEMPLOS:
   ./help.sh              → Este guia
 
 ─────────────────────────────────────────────────────────────────────────────
- 8. EXEMPLOS PRÁTICOS                                                        
+ 9. EXEMPLOS PRÁTICOS                                                        
 ─────────────────────────────────────────────────────────────────────────────
 
   # Smoke test rápido (1 amostra)
@@ -157,7 +165,7 @@ EXEMPLOS:
   MODEL=facebook/opt-350m ./reproduce_opt.sh --keep_on_gpu
 
 ─────────────────────────────────────────────────────────────────────────────
- 9. SOLUÇÃO DE PROBLEMAS                                                    
+ 10. SOLUÇÃO DE PROBLEMAS                                                    
 ─────────────────────────────────────────────────────────────────────────────
 
   ERRO: CUDA out of memory
